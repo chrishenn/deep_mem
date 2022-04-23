@@ -1,0 +1,1 @@
+singularity exec --nv /home/chris/Documents/singularity_containers/env182 ./_install.sh

@@ -1,0 +1,12 @@
+# cuda 11.1, torch 1.8.2
+# conda env create -f env182.yml
+# conda env update -f env182.yml
+
+name: env182
+channels:
+- defaults
+dependencies:
+- python=3.9
+- pip
+- pip:
+   - -renv182.txt

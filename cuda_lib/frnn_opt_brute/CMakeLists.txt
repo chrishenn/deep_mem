@@ -1,0 +1,29 @@
+cmake_minimum_required(VERSION 3.8 FATAL_ERROR)
+
+# Create project
+SET(PROJECT_NAME frnn_ts)
+SET(CMAKE_C_COMPILER gcc)
+SET(CMAKE_CXX_COMPILER g++)
+project(${PROJECT_NAME} LANGUAGES CUDA CXX)
+
+# LIBTORCH 
+#list(APPEND CMAKE_PREFIX_PATH "/om2/user/chenn/libtorch/")
+list(APPEND CMAKE_PREFIX_PATH "/home/chris/Documents/libtorch")
+FIND_PACKAGE( Torch REQUIRED )   
+
+# CUDA PACKAGE
+# FIND_PACKAGE( CUDA REQUIRED )
+
+set(CUDA_SEPARABLE_COMPILATION ON)
+set(CUDA_PROPAGATE_HOST_FLAGS OFF)
+# set(CUDA_HOST_COMPILER clang++)
+
+# Source files
+file(GLOB INTERNAL_SOURCE ${PROJECT_SOURCE_DIR}/*.cpp )
+file(GLOB CUDA_SOURCE ${PROJECT_SOURCE_DIR}/*.cu)
+file(GLOB INTERNAL_HEADERS ${PROJECT_SOURCE_DIR}/*.h )
+
+# Define our library target
+add_library(${PROJECT_NAME} SHARED ${INTERNAL_SOURCE} ${INTERNAL_HEADERS} ${CUDA_SOURCE} )
+
+target_link_libraries(${PROJECT_NAME} "${TORCH_LIBRARIES}")
