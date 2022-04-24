@@ -14,16 +14,17 @@ from torch import nn as nn
 from annoy import AnnoyIndex
 
 from cuda_lib.frnn_opt_brute import frnn_cpu
-import model.oodl_samplers as samplers
-import model.oodl_utils as o_utils
+import model.object_samplers as samplers
+import model.object_utils as o_utils
 
 t.manual_seed(7)
 
 
 
-
 ############################################################################################################
-#### Main Class for Deep Mem Storage Model
+#### Deep Mem Storage Model
+#       using an annoy index as memory
+#       relative relationships
 ############################################################################################################
 
 class Deep_Mem(nn.Module):
@@ -51,7 +52,7 @@ class Deep_Mem(nn.Module):
         if self.opt.mode == 'store':
             self._forward = self.store
         elif self.opt.mode == 'recall':
-            self.init_recall_ann()
+            self.init_proc_pools()
             self._forward = self.recall_ann
 
     def forward(self, batch):
@@ -73,7 +74,7 @@ class Deep_Mem(nn.Module):
 
 
 
-    def init_recall_ann(self):
+    def init_proc_pools(self):
         self.n_procs = os.cpu_count()
 
         self.manager = manager = mp.Manager()
@@ -102,7 +103,7 @@ class Deep_Mem(nn.Module):
 
 
 
-    ## store
+    ## store relationships in memory
     def store(self, batch):
         block_size = 1000000
 
@@ -147,10 +148,7 @@ class Deep_Mem(nn.Module):
         self.n_coalesce += 1
 
 
-
-
-
-    ## build annoy index with stored configurations
+    ## build annoy index with stored memory
     def build_ann(self, _):
 
         print('ann index build start ...')
@@ -168,9 +166,37 @@ class Deep_Mem(nn.Module):
         print('exiting ...')
         exit(0)
 
+    def build_rel_mp(self, batch):
+
+        tex,pts,imgid,batch_size = self.filter_sample(batch)
+
+        n_procs = min(batch_size.item(), self.n_procs)
+        im_per_proc = ((batch_size.item()-1) // n_procs) + 1
+        split_size = 812 * im_per_proc
+        tex, pts, imgid = tex.split(split_size), pts.split(split_size), imgid.split(split_size)
+
+        for i in range(len(tex)):
+            self.work_q.put( (tex[i], pts[i], imgid[i]) )
+
+        results = list()
+        for i in range(n_procs):
+            res = self.proc_pool.apply_async(build_rel_mp_worker,
+                                             args=(self.work_q, self.staged_q, self.rel_vec_width.item(), self.lin_rad.item(), self.mem_width.item(), self.n_rolls))
+            results.append(res)
+
+        [res.wait() for res in results]
+
+        rel_out = list()
+        pts_out = list()
+        for i in range(self.staged_q.qsize()):
+            rel, pts = self.staged_q.get()
+            rel_out.append( rel )
+            pts_out.append( pts )
+        rel, pts = t.cat(rel_out), t.cat(pts_out)
+        return rel, pts
 
 
-    ## recall
+    ## recall from memory
     def recall_ann(self, batch):
 
         print("\ncompositing the response from", batch.size(0), "seeded images onto a prediction image")
@@ -224,99 +250,46 @@ class Deep_Mem(nn.Module):
         compt = compt.clone().cpu().numpy()[0,0]
         compt = compt / compt.max()
 
-        print("no")
+        print("done")
+
+    def query_ann_serial(self, queries, k):
+        ann_path = os.path.join(self.opt.save_dir, self.opt.ann_filename)
+
+        ann_index = AnnoyIndex(self.neb_size, self.opt.ann_type)
+        ann_index.load(ann_path, prefault=False)
+
+        k_nebs = list()
+        for i, vec in enumerate(queries):
+            k_nebs.append(ann_index.get_nns_by_vector(vec, k, include_distances=True))
+
+        return k_nebs
+
+    def query_ann_mp(self, queries, k):
+
+        return_dict = self.manager.dict()
+
+        query_list = queries.chunk(self.n_procs, dim=0)
+        for i, chunk in enumerate(query_list):
+            self.work_q.put( (str(i), chunk) )
+
+        ann_path = os.path.join(self.opt.save_dir, self.opt.ann_filename)
+
+        results = list()
+        for i in range(self.n_procs):
+            res = self.proc_pool.apply_async(query_ann_k_worker, args=(self.work_q, return_dict, k, self.neb_size, ann_path, self.opt.ann_type))
+            results.append(res)
+        [res.wait() for res in results]
+
+        out = list()
+        for i in range(len(return_dict)):
+            out.extend( return_dict[str(i)] )
+        return out
 
 
 
 
-    def build_rel(self, batch):
-
-        rel_vec, pts = self.build_rel_one(batch)
-        rel_vec = self.roll_rel(rel_vec, self.n_rolls)
-
-        pts = pts.repeat(self.n_rolls, 1)
-
-        return rel_vec, pts
-
-    def build_rel_one(self, batch):
-
-        data = self.filter_thresh(self, batch)
-        data = self.sample(data)
-        tex, pts, imgid, batch_size = data
-
-        edges = frnn_cpu.frnn_cpu(pts.numpy(), imgid.numpy(), self.lin_rad.item())
-        edges = t.from_numpy(edges)
-
-        edges = t.cat([edges, t.stack([edges[:, 1], edges[:, 0]], 1)])
-        edges = edges.to(self.opt.gpu_ids[0])
-
-        ## vecs in rel_vec will bin to [0, mem_width)
-        locs = pts[:, :2].clone()
-        locs_lf, locs_rt = locs[edges[:, 0]], locs[edges[:, 1]]
-        vecs = locs_rt - locs_lf
-        vecs.div_(self.lin_rad)
-        vecs.add_(1)
-        vecs.div_(2)
-        vecs.mul_(self.mem_width)
-        vecs.round_()
-        vecs = vecs.to( t.int32 )
-
-        tex = tex.round().to( t.int32 )
-        tex_rt = tex[edges[:,1]]
-
-        args = [tex, tex_rt, vecs, edges[:, 0].contiguous() ]
-        args = [te.numpy() for te in args]
-        rel_vec = t.from_numpy( build_rel_cpu( self.rel_vec_width.item(), *args ) )
-
-        return rel_vec, pts
-
-    def build_rel_one_gpu(self, batch):
-
-        data = self.filter_sample(batch)
-        tex, pts, imgid, batch_size = data
-
-        edges = t.ops.my_ops.frnn_ts_kernel(pts.cuda(), imgid.cuda(), self.lin_rad.cuda(), t.tensor(1).cuda(), batch_size.cuda())[0]
-        edges = t.cat([edges, t.stack([edges[:, 1], edges[:, 0]], 1)])
-
-        ## vecs in rel_vec will bin to [0, mem_width)
-        locs = pts[:, :2].clone()
-        locs_lf, locs_rt = locs[edges[:, 0]], locs[edges[:, 1]]
-        vecs = locs_rt - locs_lf
-        vecs.div_(self.lin_rad)
-        vecs.add_(1)
-        vecs.div_(2)
-        vecs.mul_(self.mem_width-1)
-        vecs.round_()
-        vecs = vecs.to( t.int32 )
-
-        tex = tex.round().to( t.int32 )
-        tex_rt = tex[edges[:,1]]
-
-        t.ops.row_op.write_row_bind(self.rel_vec, self.write_cols, tex.cuda(), tex_rt.cuda(), vecs.cuda(), edges[:,0].cuda().contiguous())
-
-        return self.rel_vec.clone().cpu(), pts
-
-    def roll_rel(self, rel_vec, pts, n_roll):
-
-        rolled_rel = t.empty_like(rel_vec).repeat(n_roll+1, 1)
-
-        rolled_rel[ : rel_vec.size(0), :] = rel_vec.clone()
-
-        for i in range(1, n_roll+1):
-
-            roll = rel_vec.clone()
-            home_tex = roll[:,0]
-            roll_vecs = roll[:, 1:].roll(3, dims=1)
-            roll[:, 0] = home_tex
-            roll[:, 1:] = roll_vecs
-
-            rolled_rel[i * rel_vec.size(0) : (i+1) * rel_vec.size(0), :] = roll
-
-        pts = pts.repeat(n_roll+1, 1)
-
-        return rolled_rel, pts
-
-
+    ## Image processing
+    #####
 
     def filter_configs(self, k_confs, pts, d_thresh_lo, d_thresh_hi, conf_thresh):
 
@@ -384,7 +357,6 @@ class Deep_Mem(nn.Module):
         comp = o_utils.regrid(pred_vals.float(), pred_locs, imgid, self.img_size, avg=avg)
         return comp
 
-
     def render_unroll(self, configs, confidences, pts, negative=False, weight=False, avg=False):
 
         locs = pts[...,None].repeat(1, 1,configs.size(1))
@@ -420,60 +392,6 @@ class Deep_Mem(nn.Module):
         comp = o_utils.regrid(tex, locs, imgid, self.img_size, avg=avg)
         return comp
 
-
-
-    def query_ann_mp(self, queries, k):
-
-        return_dict = self.manager.dict()
-
-        query_list = queries.chunk(self.n_procs, dim=0)
-        for i, chunk in enumerate(query_list):
-            self.work_q.put( (str(i), chunk) )
-
-        ann_path = os.path.join(self.opt.save_dir, self.opt.ann_filename)
-
-        results = list()
-        for i in range(self.n_procs):
-            res = self.proc_pool.apply_async(query_ann_k_worker, args=(self.work_q, return_dict, k, self.neb_size, ann_path, self.opt.ann_type))
-            results.append(res)
-        [res.wait() for res in results]
-
-        out = list()
-        for i in range(len(return_dict)):
-            out.extend( return_dict[str(i)] )
-        return out
-
-
-    def build_rel_mp(self, batch):
-
-        tex,pts,imgid,batch_size = self.filter_sample(batch)
-
-        n_procs = min(batch_size.item(), self.n_procs)
-        im_per_proc = ((batch_size.item()-1) // n_procs) + 1
-        split_size = 812 * im_per_proc
-        tex, pts, imgid = tex.split(split_size), pts.split(split_size), imgid.split(split_size)
-
-        for i in range(len(tex)):
-            self.work_q.put( (tex[i], pts[i], imgid[i]) )
-
-        results = list()
-        for i in range(n_procs):
-            res = self.proc_pool.apply_async(build_rel_mp_worker,
-                                             args=(self.work_q, self.staged_q, self.rel_vec_width.item(), self.lin_rad.item(), self.mem_width.item(), self.n_rolls))
-            results.append(res)
-
-        [res.wait() for res in results]
-
-        rel_out = list()
-        pts_out = list()
-        for i in range(self.staged_q.qsize()):
-            rel, pts = self.staged_q.get()
-            rel_out.append( rel )
-            pts_out.append( pts )
-        rel, pts = t.cat(rel_out), t.cat(pts_out)
-        return rel, pts
-
-
     def gen_full_grid(self):
         D1 = t.arange(self.opt.img_size, dtype=t.int)
         D2 = t.arange(self.opt.img_size, dtype=t.int)
@@ -492,200 +410,8 @@ class Deep_Mem(nn.Module):
 
 
 
-
-    def coalesce_MP(self):
-
-        print('processing intermediates from images ...')
-        self.proc_pool.close()
-        self.proc_pool.join()
-
-        print('coalescing memory ...')
-        while not self.staged_q.empty():
-            try: self.mem += self.staged_q.get_nowait()
-            except: continue
-
-
-
-
-
-    def recall_inc(self, batch, comp=None):
-
-        (tex, pts, imgid), edges, vecs, rel_vec = self.build_rel_one(batch)
-
-        pred_config = rel_vec.clone()
-        init_conf = self.query_many(pred_config)
-
-        ## if I can make a change to a single value in a config that increases the confidence, write just that change to the neighborhood
-        ## the resulting prediction will not include the values from the seed - because changing them would not increase the conf of the neighborhood
-
-        ## build configs - each with a single change
-        configs = t.empty([pred_config.size(0) * self.n_nebs_hashed, pred_config.size(1)], dtype=pred_config.dtype, device=pred_config.device)
-
-        for i, col in enumerate(range(3, self.rel_vec_width.item(), 3)):
-
-            config_flipped = pred_config.clone()
-            config_flipped[:, col] = t.where(config_flipped[:, col].eq(0), t.ones_like(config_flipped[:, col]), t.zeros_like(config_flipped[:, col]))
-
-            configs[pred_config.size(0) * i : pred_config.size(0) * (i+1), :] = config_flipped
-
-        confs = self.query_many(configs)
-
-        good_flip = confs.gt( init_conf.repeat(self.n_nebs_hashed) )
-
-        gflip_rows = t.arange(good_flip.size(0),device=good_flip.device)
-        gflip_cols = t.arange(confs.size(0),device=confs.device).floor_divide(pred_config.size(0)).mul(3).add(1)[:,None].repeat(1,2)
-        gflip_cols[:,1].add_(1)
-        gflip_rows, gflip_cols = gflip_rows[good_flip], gflip_cols[good_flip]
-
-        ## select vecs where a flip has increased the confidence, values that caused the increase
-        vecs_0 = configs[(gflip_rows[:,None], gflip_cols)]
-
-        ## TODO: these '0' vals are a vote for lower value at loc
-        ## TODO: weight these votes by config confidence?
-        vals = configs[(gflip_rows, gflip_cols[:,1].add(1))]
-
-        ## transform relative vecs to locations
-        locs = pts[:,:2].repeat(self.n_nebs_hashed, 1)[good_flip]
-
-        vecs = vecs_0.float()
-        vecs.div_(self.mem_width-1).mul_(2).sub_(1).mul_(self.lin_rad)
-
-        pred_locs = locs.add(vecs)
-
-        ## drop padded vecs
-        not_pad = vecs_0[:,0].ne(0) | vecs_0[:,1].ne(0)
-        pred_locs = pred_locs[not_pad]
-        pred_vals = vals[not_pad]
-
-        if pred_locs.size(0) > 0:
-            assert pred_locs.min() >= -1e-5
-            assert pred_locs.max() < self.img_size
-
-        pred_locs.clamp_(0, self.img_size-1)
-
-        imgid = t.zeros_like(pred_locs[:, 0]).long()
-        comp = o_utils.regrid(pred_vals.float(), pred_locs, imgid, self.img_size, avg=False, batch=comp)
-        return comp
-
-    def recall_hash(self, batch, comp=None):
-        (tex, pts, imgid), edges, vecs, rel_vec = self.build_rel_one(batch)
-
-        pred_config = rel_vec.clone()
-        init_conf = self.query_ann(pred_config)
-
-        ## build configs - each with a single change
-        configs = t.empty([pred_config.size(0) * self.n_nebs_hashed, pred_config.size(1)], dtype=pred_config.dtype, device=pred_config.device)
-
-        for i, col in enumerate(range(3, self.rel_vec_width.item(), 3)):
-            config_flipped = pred_config.clone()
-            config_flipped[:, col] = t.where(config_flipped[:, col].eq(0), t.ones_like(config_flipped[:, col]), t.zeros_like(config_flipped[:, col]))
-
-            configs[pred_config.size(0) * i: pred_config.size(0) * (i + 1), :] = config_flipped
-
-        confs = self.query_ann(configs)
-
-        good_flip = confs.gt(init_conf.repeat(self.n_nebs_hashed))
-
-        gflip_rows = t.arange(good_flip.size(0), device=good_flip.device)
-        gflip_cols = t.arange(confs.size(0), device=confs.device).floor_divide(pred_config.size(0)).mul(3).add(1)[:, None].repeat(1, 2)
-        gflip_cols[:, 1].add_(1)
-        gflip_rows, gflip_cols = gflip_rows[good_flip], gflip_cols[good_flip]
-
-        ## select vecs where a flip has increased the confidence, values that caused the increase
-        vecs_0 = configs[(gflip_rows[:, None], gflip_cols)]
-
-        vals = configs[(gflip_rows, gflip_cols[:, 1].add(1))]
-        vals.mul_(2).sub_(1).mul_( init_conf.repeat(self.n_nebs_hashed)[gflip_rows] )
-        vals[vals.lt(0)] = 0
-
-        ## transform relative vecs to locations
-        locs = pts[:, :2].repeat(self.n_nebs_hashed, 1)[good_flip]
-
-        vecs = vecs_0.float()
-        vecs.div_(self.mem_width - 1).mul_(2).sub_(1).mul_(self.lin_rad)
-
-        pred_locs = locs.add(vecs)
-
-        ## drop padded vecs
-        not_pad = vecs_0[:, 0].ne(0) | vecs_0[:, 1].ne(0)
-        pred_locs = pred_locs[not_pad]
-        pred_vals = vals[not_pad]
-
-        if pred_locs.size(0) > 0:
-            assert pred_locs.min() >= -1e-5
-            assert pred_locs.max() < self.img_size
-
-        pred_locs.clamp_(0, self.img_size - 1)
-
-        imgid = t.zeros_like(pred_locs[:, 0]).long()
-        comp = o_utils.regrid(pred_vals.float(), pred_locs, imgid, self.img_size, avg=False, batch=comp)
-        return comp
-
-    def query_ann_k_0(self, queries, k):
-
-        queries = queries.cpu().numpy()
-
-        k_nebs = list()
-        for i,vec in enumerate(queries):
-
-            k_nebs.append( self.ann_index.get_nns_by_vector(vec, k, include_distances=True) )
-
-        return k_nebs
-
-
-
-    def query_ann(self, queries, k):
-        ann_path = os.path.join(self.opt.save_dir, self.opt.ann_filename)
-
-        ann_index = AnnoyIndex(self.neb_size, self.opt.ann_type)
-        ann_index.load(ann_path, prefault=False)
-
-        k_nebs = list()
-        for i, vec in enumerate(queries):
-            k_nebs.append(ann_index.get_nns_by_vector(vec, k, include_distances=True))
-
-        return k_nebs
-
-
-
-
-
-    def query_hash(self, queries):
-
-        dev = queries.device
-        queries = queries.cpu().numpy()
-
-        true_values = np.empty_like(queries[:,0]).astype( queries.dtype )
-        hash_vals = np.empty_like(queries[:,0]).astype( queries.dtype )
-
-        for i,vec in enumerate(queries):
-            true_values[i] = self.mem[tuple(vec)]
-            list_res = self.engine.neighbours(vec)
-
-            if len(list_res) > 0:
-                hash_vals[i] = list_res[0][1]
-            else:
-                hash_vals[i] = 0
-
-        true_values = t.from_numpy( true_values ).to(dev)
-        hash_vals = t.from_numpy( hash_vals ).to(dev)
-
-        mask = true_values.ne(0)
-        true_values, hash_vals = true_values[mask], hash_vals[mask]
-        true_values.ne(0).sum(), hash_vals.ne(0).sum()
-
-        return hash_vals
-
-
-
-
-
-
-
-
-
 ############################################################################################################
-#### Top-Level Helpers for Deep Mem Multiprocessing Operations
+#### Helpers for Multiprocessing Operations
 ############################################################################################################
 
 def query_ann_k_worker(work_q, return_dict, k, index_size, ann_path, ann_type):
@@ -797,20 +523,7 @@ def roll_rel(rel_vec, n_roll):
     return rolled_rel
 
 
-def roll_rel_torch(rel_vec, n_roll):
 
-    rolled_rel = t.empty_like(rel_vec).repeat(n_roll, 1)
-    for i in range(n_roll):
-
-        roll = rel_vec.clone()
-        home_tex = roll[:,0]
-        roll_vecs = roll[:, 1:].roll(3, dims=1)
-        roll[:,0] = home_tex
-        roll[:, 1:] = roll_vecs
-
-        rolled_rel[i * rel_vec.size(0) : (i+1) * rel_vec.size(0), :] = roll
-
-    return rolled_rel
 
 
 

@@ -3,7 +3,7 @@ from torchvision import transforms
 
 import numpy as np
 
-from model import oodl_utils
+from model import object_utils
 
 
 ############### Artificial Testing Images
