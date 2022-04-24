@@ -185,18 +185,7 @@ def save_model(model, opt):
     print("model save done")
 
 
-def init_vis(opt):
-    # To enable visualization of per-epoch train and test_acc, run "visdom" or "python -m visdom.server" in a terminal or (ideally)
-    # a tmux session and navigate to localhost:8097 in a browser.
 
-    if opt.vis_network or opt.vis_file:
-        from model.oodl_vis import OODL_Vis
-
-        try: vis = OODL_Vis(opt)
-        except: vis = None
-
-    else: vis = None
-    return vis
 
 def init_environment(opt):
     torch.backends.cudnn.enabled = True
@@ -219,7 +208,6 @@ def init_environment(opt):
 def train_single(opt):
 
     init_environment(opt)
-    opt.vis = init_vis(opt)
 
     opt.train_loader = get_loader(opt, True)
 
