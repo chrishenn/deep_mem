@@ -1,6 +1,6 @@
 ############################################################################################################
 #### Class for Deep Mem Storage Model and multiprocessing helpers
-#### Author: Chris Henn
+#### Author: Chris Henn (https://github.com/chrishenn)
 ############################################################################################################
 
 import atexit, os
