@@ -3,14 +3,12 @@
 <div id="img0" align="center">
     <img src="doc/images/seed_nine.png" height="200" >
     <img src="doc/images/htmp_nine.png" height="200" >
-&ensp;
     <img src="doc/images/ambiguous_5.png" height="200" >
     <img src="doc/images/def_not_5.png" height="200" >
 </div>
 <div id="img1" align="center">
     <img src="doc/images/weight_1.png" height="200" >
     <img src="doc/images/missing_middle_8.png" height="200" >
-&ensp;
     <img src="doc/images/3bottom.png" height="200" >
     <img src="doc/images/top3.png" height="200" >
 </div>
