@@ -1,4 +1,4 @@
-<h1 align="center" style="margin-top: 0px;">Deep Memory: Explicit and Searchable Data Modelling</h1>
+<h1 align="center" style="margin-top: 0px;">Deep Memory: Explicit and Searchable Data Modeling</h1>
 
 <div id="img0" align="center">
     <img src="doc/images/seed_nine.png" height="200" >
