@@ -5,7 +5,10 @@
 proj_dir=$(pwd)
 
 # return true cores = logical-cores/2
-n_proc=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l)
+# n_proc=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l)
+
+# return cores = logical-cores
+n_proc=$(lscpu -b -p=Core,Socket | grep -v '^#' | wc -l)
 
 # We will not clean build a lib unless the build dir is not present in the lib folder, or the -c option is passed in
 clean_build_flag=0
